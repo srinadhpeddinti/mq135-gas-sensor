@@ -1,9 +1,18 @@
-// Enhanced MQ-135 Gas Sensor Reading on NodeMCU ESP8266
+// Enhanced MQ-135 Gas Sensor Reading on NodeMCU ESP8266 - Version 2.0
 // This version incorporates hardware-specific ADC voltage, robust constants,
-// safer EEPROM handling, and improved readability for better accuracy and maintenance.
+// safer EEPROM handling, improved readability, watchdog support, and retry logic
+// for better accuracy, reliability, and maintenance.
 
 #include <EEPROM.h>
 #include <math.h> // For fabs, pow, sqrt (Arduino compatibility)
+
+#ifdef ESP8266
+  #include <Ticker.h>
+  Ticker watchdogTicker;
+#endif
+
+// --- Firmware Version ---
+const char* FIRMWARE_VERSION = "2.0";
 
 // --- Hardware & ADC Configuration ---
 const int MQ_PIN = A0;
@@ -18,7 +27,7 @@ const float RL_VALUE = 10.0; // Load resistance in Kilo-Ohms
 // --- Calibration & Reading Parameters ---
 const int CALIBRATION_SAMPLES = 100;    // Number of samples for calibration
 const int CALIBRATION_INTERVAL = 200; // Milliseconds between calibration samples
-const int READING_SAMPLES = 20;       // Number of- samples for a single reading
+const int READING_SAMPLES = 20;       // Number of samples for a single reading
 const int PREHEAT_TIME_MS = 30000;    // 30 seconds for sensor preheating
 const unsigned long READ_INTERVAL_MS = 2000; // 2 seconds between readings
 const bool FORCE_CALIBRATION_ON_BOOT = false; // Set to true to force calibration on every startup
@@ -29,10 +38,21 @@ const float FILTER_STDDEV_MULTIPLIER = 1.5; // How many standard deviations from
 const int MIN_VALID_SAMPLES_FOR_READ = 5;  // Minimum samples needed before filtering
 const int MIN_FILTERED_SAMPLES = 3;      // Minimum samples required after filtering
 
+// --- Retry Configuration ---
+const int MAX_READING_RETRIES = 3;      // Maximum retry attempts for failed readings
+const int RETRY_DELAY_MS = 100;         // Delay between retries in milliseconds
+
 // --- EEPROM Configuration ---
 const int EEPROM_SIZE = 512;
 const int R0_EEPROM_ADDR = 0;
 const float R0_MAGIC_NUMBER = 12345.67f; // Use 'f' suffix for float literals
+const float MAGIC_TOLERANCE = 0.1f;     // Tolerance for magic number comparison (increased from 0.01)
+
+// --- Watchdog Configuration (ESP8266) ---
+#ifdef ESP8266
+  const unsigned long WATCHDOG_INTERVAL_MS = 5000; // Feed watchdog every 5 seconds
+  unsigned long lastWatchdogFeed = 0;
+#endif
 
 // --- Sensor State ---
 float R0 = 1.0;
@@ -42,6 +62,7 @@ unsigned long startTime = 0;
 unsigned long lastReadTime = 0;
 
 // --- Gas Curve Data & Thresholds ---
+// IMPORTANT: Verify these curve parameters (A, B values) match your specific MQ-135 datasheet version.
 // This data is derived from the MQ-135 datasheet.
 struct GasThreshold { float warning, danger; };
 struct GasData {
@@ -71,6 +92,31 @@ float calibrateR0();
 void saveR0ToEEPROM();
 bool loadR0FromEEPROM();
 void handleSerialCommands();
+void feedWatchdog();
+
+#ifdef ESP8266
+void watchdogCallback();
+#endif
+
+// --- Watchdog Functions (ESP8266) ---
+#ifdef ESP8266
+void watchdogCallback() {
+  // Callback function for watchdog timer
+  // This is called periodically; actual feeding happens in feedWatchdog()
+}
+
+void feedWatchdog() {
+  unsigned long now = millis();
+  if (now - lastWatchdogFeed >= WATCHDOG_INTERVAL_MS) {
+    ESP.wdtFeed();
+    lastWatchdogFeed = now;
+  }
+}
+#else
+void feedWatchdog() {
+  // Watchdog not supported on this platform
+}
+#endif
 
 // --- Setup ---
 void setup() {
@@ -84,8 +130,19 @@ void setup() {
   EEPROM.begin(EEPROM_SIZE);
   startTime = millis();
 
-  Serial.println("\n=== Enhanced MQ-135 Gas Sensor ===");
+  // Disable watchdog during setup (ESP8266)
+  #ifdef ESP8266
+    ESP.wdtDisable();
+  #endif
+
+  Serial.println("\n=== Enhanced MQ-135 Gas Sensor v" + String(FIRMWARE_VERSION) + " ===");
   Serial.printf("ADC Reference Voltage: %.1fV\n", ADC_REF_VOLTAGE);
+  
+  #ifdef ESP8266
+    Serial.println("Platform: ESP8266");
+  #else
+    Serial.println("Platform: Arduino");
+  #endif
 
   if (loadR0FromEEPROM()) {
     Serial.printf("✓ Loaded R0 from EEPROM = %.3f kΩ\n", R0);
@@ -102,11 +159,18 @@ void setup() {
     }
   }
 
+  // Enable watchdog during operation (ESP8266)
+  #ifdef ESP8266
+    ESP.wdtEnable(8000); // 8-second timeout
+    lastWatchdogFeed = millis();
+  #endif
+
   Serial.println("Sensor preheating started...");
 }
 
 // --- Main Loop ---
 void loop() {
+  feedWatchdog();
   handleSerialCommands();
 
   if (!isPreheated) {
@@ -139,7 +203,7 @@ void loop() {
 void takeReading() {
   float Rs = readRs();
   if (Rs < 0) {
-    Serial.println("⚠ Invalid Rs reading, skipping analysis.");
+    Serial.println("⚠ Invalid Rs reading after retries, skipping analysis.");
     return;
   }
 
@@ -174,50 +238,90 @@ void takeReading() {
 }
 
 /**
- * @brief Reads the sensor resistance (Rs) with outlier filtering.
- * @return The calculated sensor resistance in kOhms, or -1.0 on failure.
+ * @brief Reads the sensor resistance (Rs) with outlier filtering and retry logic.
+ * @return The calculated sensor resistance in kOhms, or -1.0 on failure after all retries.
  */
 float readRs() {
-  float volts[READING_SAMPLES];
-  int validSampleCount = 0;
+  for (int retry = 0; retry < MAX_READING_RETRIES; retry++) {
+    float volts[READING_SAMPLES];
+    int validSampleCount = 0;
 
-  for (int i = 0; i < READING_SAMPLES; i++) {
-    int rawValue = analogRead(MQ_PIN);
-    if (rawValue >= 0 && rawValue <= ADC_MAX_VALUE) {
-        volts[validSampleCount++] = rawValue * (ADC_REF_VOLTAGE / ADC_MAX_VALUE);
+    for (int i = 0; i < READING_SAMPLES; i++) {
+      int rawValue = analogRead(MQ_PIN);
+      if (rawValue >= 0 && rawValue <= ADC_MAX_VALUE) {
+          volts[validSampleCount++] = rawValue * (ADC_REF_VOLTAGE / ADC_MAX_VALUE);
+      }
+      delay(5);
     }
-    delay(5);
-  }
 
-  if (validSampleCount < MIN_VALID_SAMPLES_FOR_READ) return -1.0;
-
-  // Calculate mean and standard deviation for outlier filtering
-  float sum = 0, mean = 0, stdev = 0;
-  for (int i = 0; i < validSampleCount; i++) sum += volts[i];
-  mean = sum / validSampleCount;
-
-  for (int i = 0; i < validSampleCount; i++) stdev += pow(volts[i] - mean, 2);
-  stdev = sqrt(stdev / validSampleCount);
-
-  // Filter out values beyond the standard deviation multiplier
-  float filteredSum = 0;
-  int filteredCount = 0;
-  for (int i = 0; i < validSampleCount; i++) {
-    if (fabs(volts[i] - mean) < stdev * FILTER_STDDEV_MULTIPLIER) { // Use fabs for float absolute value
-      filteredSum += volts[i];
-      filteredCount++;
+    if (validSampleCount < MIN_VALID_SAMPLES_FOR_READ) {
+      if (retry < MAX_READING_RETRIES - 1) {
+        Serial.printf("  Retry %d/%d: Insufficient valid samples (%d < %d)\n", 
+                      retry + 1, MAX_READING_RETRIES, validSampleCount, MIN_VALID_SAMPLES_FOR_READ);
+        delay(RETRY_DELAY_MS);
+        continue;
+      } else {
+        Serial.printf("  ✗ Failed after %d retries: Not enough valid samples\n", MAX_READING_RETRIES);
+        return -1.0;
+      }
     }
+
+    // Calculate mean and standard deviation for outlier filtering
+    float sum = 0, mean = 0, stdev = 0;
+    for (int i = 0; i < validSampleCount; i++) sum += volts[i];
+    mean = sum / validSampleCount;
+
+    for (int i = 0; i < validSampleCount; i++) stdev += pow(volts[i] - mean, 2);
+    stdev = sqrt(stdev / validSampleCount);
+
+    // Filter out values beyond the standard deviation multiplier
+    float filteredSum = 0;
+    int filteredCount = 0;
+    for (int i = 0; i < validSampleCount; i++) {
+      if (fabs(volts[i] - mean) < stdev * FILTER_STDDEV_MULTIPLIER) { // Use fabs for float absolute value
+        filteredSum += volts[i];
+        filteredCount++;
+      }
+    }
+
+    if (filteredCount < MIN_FILTERED_SAMPLES) {
+      if (retry < MAX_READING_RETRIES - 1) {
+        Serial.printf("  Retry %d/%d: Insufficient filtered samples (%d < %d)\n", 
+                      retry + 1, MAX_READING_RETRIES, filteredCount, MIN_FILTERED_SAMPLES);
+        delay(RETRY_DELAY_MS);
+        continue;
+      } else {
+        Serial.printf("  ✗ Failed after %d retries: Not enough filtered samples\n", MAX_READING_RETRIES);
+        return -1.0;
+      }
+    }
+
+    float avgVoltage = filteredSum / filteredCount;
+    
+    if (avgVoltage < 0.01) {
+      if (retry < MAX_READING_RETRIES - 1) {
+        Serial.printf("  Retry %d/%d: Voltage too low (%.3fV < 0.01V)\n", 
+                      retry + 1, MAX_READING_RETRIES, avgVoltage);
+        delay(RETRY_DELAY_MS);
+        continue;
+      } else {
+        Serial.printf("  ✗ Failed after %d retries: Voltage too low\n", MAX_READING_RETRIES);
+        return -1.0;
+      }
+    }
+
+    // VRL = Vout = avgVoltage. We need to calculate Rs.
+    // Vout = Vc * RL / (RL + Rs) -> (RL + Rs) = Vc * RL / Vout -> Rs = (Vc * RL / Vout) - RL
+    float calculatedRs = RL_VALUE * (ADC_REF_VOLTAGE - avgVoltage) / avgVoltage;
+    
+    if (retry > 0) {
+      Serial.printf("  ✓ Success on retry %d/%d\n", retry + 1, MAX_READING_RETRIES);
+    }
+    
+    return calculatedRs;
   }
-
-  if (filteredCount < MIN_FILTERED_SAMPLES) return -1.0; // Ensure enough valid points after filtering
-
-  float avgVoltage = filteredSum / filteredCount;
   
-  if (avgVoltage < 0.01) return -1.0; // Prevent division by near-zero voltage
-
-  // VRL = Vout = avgVoltage. We need to calculate Rs.
-  // Vout = Vc * RL / (RL + Rs) -> (RL + Rs) = Vc * RL / Vout -> Rs = (Vc * RL / Vout) - RL
-  return RL_VALUE * (ADC_REF_VOLTAGE - avgVoltage) / avgVoltage;
+  return -1.0;
 }
 
 /**
@@ -237,6 +341,7 @@ float calibrateR0() {
     // Simple progress indicator
     if (i % 10 == 0) Serial.print(".");
     delay(CALIBRATION_INTERVAL);
+    feedWatchdog(); // Feed watchdog during calibration
   }
   Serial.println("\nCalibration sampling complete.");
 
@@ -274,9 +379,15 @@ void saveR0ToEEPROM() {
 bool loadR0FromEEPROM() {
   float magic;
   EEPROM.get(R0_EEPROM_ADDR, magic);
-  if (fabs(magic - R0_MAGIC_NUMBER) < 0.01) { // Use fabs for float absolute value
+  if (fabs(magic - R0_MAGIC_NUMBER) < MAGIC_TOLERANCE) { // Use MAGIC_TOLERANCE constant
     EEPROM.get(R0_EEPROM_ADDR + sizeof(float), R0);
-    return R0 > 0.1 && R0 < 100.0; // Sanity check for a reasonable R0 value
+    // Sanity check for a reasonable R0 value
+    if (R0 > 0.1 && R0 < 100.0) {
+      return true;
+    } else {
+      Serial.printf("⚠ R0 value out of range: %.3f kΩ (expected 0.1-100.0 kΩ)\n", R0);
+      return false;
+    }
   }
   return false;
 }
@@ -307,14 +418,19 @@ void handleSerialCommands() {
     Serial.println("✓ EEPROM has been reset. Please 'calibrate' again in clean air.");
   } else if (cmd == "info") {
     Serial.println("\n--- Sensor Info ---");
+    Serial.printf("Firmware Version: %s\n", FIRMWARE_VERSION);
+    #ifdef ESP8266
+      Serial.println("Platform: ESP8266 (Watchdog Enabled)");
+    #else
+      Serial.println("Platform: Arduino");
+    #endif
     Serial.printf("R0 Value: %.3f kΩ\n", R0);
     Serial.printf("Preheated: %s\n", isPreheated ? "Yes" : "No");
     Serial.printf("Calibrated: %s\n", isCalibrated ? "Yes" : "No");
+    Serial.printf("Max Retries: %d\n", MAX_READING_RETRIES);
+    Serial.printf("Magic Tolerance: %.3f\n", MAGIC_TOLERANCE);
     Serial.println("-------------------");
   } else if (cmd.length() > 0) {
     Serial.println("Unknown command. Available commands: 'calibrate', 'reset', 'info'");
   }
 }
-
-
-
